@@ -6,6 +6,11 @@ import urllib.request
 import xml.etree.ElementTree as ET
 
 from .errors import ManagerError, RemoteError, S3_ERROR_CODES
+from .profiles import safe_name
+
+
+def managed_comment(user):
+    return 'RXS3 managed | ' + safe_name(user['name'])
 
 
 def safe_s3_error(data):
@@ -109,7 +114,7 @@ class Panel:
     def create_client(self, user, inbound):
         self.call('clients/add', {'client': {'email': user['email'], 'id': user['uuid'],
             'subId': user['sub_id'], 'enable': True, 'flow': '', 'totalGB': user['quota'],
-            'expiryTime': user['expires'], 'comment': 'RXS3 managed', 'limitIp': 0,
+            'expiryTime': user['expires'], 'comment': managed_comment(user), 'limitIp': 0,
             'tgId': 0, 'reset': 0, 'trafficReset': 'never'}, 'inboundIds': [inbound]})
 
     def update_client(self, record, **changes):
@@ -122,6 +127,16 @@ class Panel:
         payload['id'] = source['uuid']
         payload.update(changes)
         self.call('clients/update/' + urllib.parse.quote(source['email'], safe=''), payload)
+
+    def set_inbound_encryption(self, record, encryption):
+        # 3x-ui stores this public client-side value in settings for its UI/link
+        # generator. Keep the server decryption key and all existing clients.
+        payload = json.loads(json.dumps(record))
+        settings = payload['settings']
+        if isinstance(settings, str): settings = json.loads(settings)
+        settings['encryption'] = encryption
+        payload['settings'] = settings
+        self.call('inbounds/update/' + str(record['id']), payload)
 
     def delete_client(self, email):
         self.call('clients/del/' + urllib.parse.quote(email, safe='') + '?keepTraffic=1', {})
