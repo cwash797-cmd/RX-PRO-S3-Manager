@@ -8,7 +8,7 @@ import uuid
 import xml.etree.ElementTree as ET
 
 from .http import request
-from .errors import ManagerError, RemoteError
+from .errors import ManagerError, RemoteError, CloudError
 
 HOSTS = {'https://hb.ru-msk.vkcloud-storage.ru', 'https://hb.vkcloud-storage.ru'}
 
@@ -60,13 +60,39 @@ class S3:
         self.endpoint, self.bucket = endpoint, validate_bucket(bucket)
         self.access, self.secret = access, secret
 
-    def call(self, method, key='', query=None, body=b'', expected=(200,204)):
-        path = '/' + self.bucket
+    def call(self, method, key='', query=None, body=b'', expected=(200,204), account=False):
+        path = '/' if account else '/' + self.bucket
         if key: path += '/' + urllib.parse.quote(key, safe='/-_.~')
         url, headers = sigv4(method,self.endpoint+path,query or {},body,self.access,self.secret)
-        status, data = request(url,method,headers,body,'VK S3')
-        if status not in expected: raise RemoteError('VK S3',status)
-        return data
+        operation = 'ListBuckets' if account else self.operation(method, key, query or {})
+        try:
+            status, data = request(url,method,headers,body,'VK S3')
+        except RemoteError:
+            raise CloudError(operation) from None
+        if status not in expected:
+            code = ''
+            if data:
+                try: code = fields(parse_xml(data)).get('Code', '')
+                except RemoteError: pass
+            raise CloudError(operation, status, code)
+        return data if status < 400 else b''
+
+    @staticmethod
+    def operation(method, key, query):
+        if 'pak' in query:
+            return {'GET': 'ListPrefixKeys', 'PUT': 'CreatePrefixKey', 'DELETE': 'DeletePrefixKey'}.get(method, 'PAK')
+        for field, name in {'versioning': 'GetBucketVersioning', 'object-lock': 'GetObjectLockConfiguration',
+                            'acl': 'GetBucketAcl', 'policy': 'GetBucketPolicy', 'website': 'GetBucketWebsite',
+                            'list-type': 'ListObjectsV2'}.items():
+            if field in query: return name
+        if key: return {'GET': 'GetObject', 'PUT': 'PutObject', 'DELETE': 'DeleteObject'}.get(method, 'ObjectRequest')
+        return {'HEAD': 'HeadBucket', 'PUT': 'CreateBucket'}.get(method, 'BucketRequest')
+
+    def check_account(self):
+        # Read-only account-scope request: useful error XML, unlike HEAD, and
+        # distinguishes account credentials from bucket/prefix-only credentials.
+        root = parse_xml(self.call('GET', account=True))
+        if local(root.tag) != 'ListAllMyBucketsResult': raise RemoteError('VK ListBuckets XML')
 
     def create_bucket(self): self.call('PUT')
 

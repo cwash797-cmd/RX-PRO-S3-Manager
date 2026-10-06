@@ -12,11 +12,11 @@ import subprocess
 import sys
 import time
 
-from .errors import ManagerError, RemoteError
+from .errors import ManagerError, RemoteError, CloudError
 from .http import Panel, validate_panel_url
 from .runtime import run
 from .s3 import S3, validate_bucket
-from .secure import Store, atomic_json, load_private, private_dir
+from .secure import Store, atomic_json, load_private, private_dir, identifier
 
 STATE = Path('/var/lib/rxs3')
 HOME = Path('/opt/rxs3')
@@ -60,6 +60,94 @@ def choose_port(prompt, default):
     if not 1024 <= port <= 65535: raise ManagerError('Нужен порт от 1024 до 65535')
     free_port(port)
     return port
+
+
+def setup_status():
+    """Read-only, redacted status; absence is distinct from invalid/private files."""
+    for name, state in [('config.json', 'ready'), ('setup.json', 'pending')]:
+        path = STATE / name
+        if path.exists() or path.is_symlink():
+            config = load_private(path)
+            if not isinstance(config, dict): raise ManagerError('Файл настройки повреждён; не удаляйте реестр')
+            identifier(config.get('installation'))
+            return {'state': state, 'stage': config.get('setup_stage', 'legacy' if state == 'pending' else 'ready'),
+                    'cloud_keys_saved': bool(config.get('accessKey') and config.get('secretKey')),
+                    'panel_port': config.get('panel_port'), 'web_port': config.get('web_port'),
+                    'last_vk_error': config.get('last_vk_error'), 'next_command': 'sudo rxs3' if state == 'ready' else 'sudo rxs3 setup'}
+    return {'state': 'pending' if (HOME / 'fresh-panel-pending').is_file() else 'not_configured',
+            'stage': 'questions', 'cloud_keys_saved': False, 'next_command': 'sudo rxs3 setup'}
+
+
+def print_ports(config):
+    print('Порты и совместимость:')
+    if config.get('fresh') and config.get('web_port'):
+        print(f"  Панель: 127.0.0.1:{config['web_port']}/TCP — только локально, доступ через SSH-туннель.")
+    else:
+        print('  Адрес и порт существующей панели не изменяются.')
+    if config.get('panel_port'):
+        print(f"  Вход S3 в панели: 127.0.0.1:{config['panel_port']}/TCP — только локально.")
+    print('  Облако: исходящие HTTPS-соединения на 443/TCP; новый публичный VPN-порт не нужен.')
+    print('  Другие конфигурации можно добавлять на незанятых портах; управляемый вход S3 не изменяйте.')
+
+
+def yes_no(prompt, default=False):
+    while True:
+        value = input(prompt).strip().lower()
+        if not value: return default
+        if value in ('да', 'д', 'yes', 'y'): return True
+        if value in ('нет', 'н', 'no', 'n'): return False
+        print('Введите да или нет. Enter означает нет.')
+
+
+def collect_settings(config, pending):
+    def save(**values):
+        config.update(values)
+        config['setup_stage'] = 'questions'
+        atomic_json(pending, config)
+    if config['fresh']:
+        if 'web_port' not in config: save(web_port=choose_port('Локальный порт панели', 2053))
+        if 'web_password' not in config:
+            save(web_path='/rxs3-' + secrets.token_hex(12) + '/', web_user='rxs3-admin',
+                 web_password=secrets.token_urlsafe(30))
+        if 'panel_url' not in config:
+            save(panel_url=f"http://127.0.0.1:{config['web_port']}{config['web_path']}")
+    else:
+        print('Существующие конфигурации, пароль и настройки панели не меняются.')
+        if 'panel_url' not in config: save(panel_url=validate_panel_url(input('URL панели с её base path: ').strip()))
+        if 'panel_token' not in config: save(panel_token=secret('Admin API token 3x-ui (ввод скрыт): '))
+        Panel(config['panel_url'], config['panel_token']).inbounds()
+    if 'panel_port' not in config:
+        while True:
+            port = choose_port('Локальный порт S3-входа (TCP)', 10001)
+            if port != config.get('web_port'):
+                save(panel_port=port)
+                break
+            print('Порт S3-входа должен отличаться от порта панели.')
+    print_ports(config)
+    print('VK Cloud: Object Storage → Аккаунты → ключ доступа АККАУНТА, не ключ из вкладки бакета.')
+    print('Нужен отдельный ПРИВАТНЫЙ бакет в Москве: без версионирования, блокировки и публичных политик.')
+    print('Папки, файлы и пользовательские ключи вручную создавать не нужно — этим занимается менеджер.')
+    if 'endpoint' not in config: save(endpoint='https://hb.ru-msk.vkcloud-storage.ru')
+    if 'accessKey' not in config: save(accessKey=secret('Access Key ID аккаунта (ввод скрыт): '))
+    if 'secretKey' not in config: save(secretKey=secret('Secret Key той же пары (ввод скрыт): '))
+    if 'bucket' not in config:
+        while True:
+            value = input('Точное имя вашего приватного бакета (если создаст менеджер — новое уникальное имя): ').strip()
+            try:
+                save(bucket=validate_bucket(value))
+                break
+            except ManagerError as error: print(error)
+    if 'create_bucket' not in config:
+        save(create_bucket=yes_no('Если бакета нет, разрешить менеджеру создать его? [да/нет; Enter = нет]: '))
+    if 'decryption' not in config:
+        keys = run(['/usr/local/x-ui/bin/xray-linux-amd64', 'vlessenc']).stdout.decode()
+        dec = re.search(r'"decryption": "([^"]+)"', keys)
+        enc = re.search(r'"encryption": "([^"]+)"', keys)
+        if not dec or not enc: raise ManagerError('Не удалось создать VLESS Encryption')
+        save(decryption=dec.group(1), encryption=enc.group(1).replace('.0rtt.', '.1rtt.'),
+             decryption_sha256=hashlib.sha256(dec.group(1).encode()).hexdigest())
+    config['setup_stage'] = 'panel'
+    atomic_json(pending, config)
 
 
 def local_token(name):
@@ -113,53 +201,48 @@ def bootstrap():
             proc.wait()
 
 
-def setup():
+def setup(edit_vk=False):
     private_dir(STATE)
     store = Store(STATE)
     try:
         with store.locked():
             if (STATE / 'config.json').exists():
-                load_private(STATE / 'config.json')
+                ready = load_private(STATE / 'config.json')
+                if edit_vk:
+                    raise ManagerError('Настройка уже завершена. Смена аккаунта/бакета активной установки этим параметром запрещена.')
                 run(['systemctl', 'enable', '--now', 'rxs3-sync.timer'])
                 (HOME / 'fresh-panel-pending').unlink(missing_ok=True)
                 print('Менеджер уже настроен; таймер синхронизации включён. Панель/бакет не изменены.')
+                print_ports(ready)
                 return
+            if store.users():
+                raise ManagerError('Есть реестр пользователей, но нет завершённой настройки. Не удаляйте файлы; требуется восстановление из копии.')
             pending = STATE / 'setup.json'
-            if pending.exists():
+            if pending.exists() or pending.is_symlink():
                 config = load_private(pending)
-                print('Продолжаю сохранённую операцию настройки; новые ключи не генерируются без необходимости.')
+                identifier(config.get('installation'))
+                print('Найдена незавершённая настройка. Сохранённые значения и уже созданные ресурсы сохраняются.')
+                if (not edit_vk and sys.stdin.isatty() and config.get('accessKey') and config.get('secretKey')
+                        and (config.get('last_vk_error') or 'setup_stage' not in config)):
+                    print('1 — повторить проверку; 2 — исправить ключи/бакет VK; 0 — выйти без изменений.')
+                    choice = input('Действие [1]: ').strip() or '1'
+                    if choice == '0': return
+                    if choice not in ('1', '2'): raise ManagerError('Нужно выбрать 1, 2 или 0')
+                    edit_vk = choice == '2'
             else:
-                version = run([PANEL_BINARY, '-v']).stdout.strip()
-                if version != b'3.9.0': raise ManagerError('Нужна обычная локальная 3x-ui ровно версии 3.9.0')
-                fresh = (HOME / 'fresh-panel-pending').is_file()
-                install_id = secrets.token_hex(12)
-                config = {'installation': install_id, 'fresh': fresh, 'format': 1}
-                if fresh:
-                    config.update(web_port=choose_port('Локальный порт панели', 2053),
-                                  web_path='/rxs3-' + secrets.token_hex(12) + '/',
-                                  web_user='rxs3-admin', web_password=secrets.token_urlsafe(30))
-                    config['panel_url'] = f"http://127.0.0.1:{config['web_port']}{config['web_path']}"
-                else:
-                    print('Существующие inbound, WS, пароль, подписки и настройки панели не меняются.')
-                    config['panel_url'] = validate_panel_url(input('URL панели с её base path: ').strip())
-                    config['panel_token'] = secret('Admin API token 3x-ui (ввод скрыт): ')
-                    Panel(config['panel_url'], config['panel_token']).inbounds()
-                config['panel_port'] = choose_port('Loopback порт нового S3 inbound', 10001)
-                if config['panel_port'] == config.get('web_port'): raise ManagerError('Порты должны различаться')
-                print('Нужны ключи ОТДЕЛЬНОЙ учётной записи Object Storage VK Москва.')
-                config['endpoint'] = 'https://hb.ru-msk.vkcloud-storage.ru'
-                config['accessKey'] = secret('VK Access Key ID (скрыто): ')
-                config['secretKey'] = secret('VK Secret Key (скрыто): ')
-                config['bucket'] = validate_bucket(input('Имя отдельного приватного бакета [rxs3-' + install_id + ']: ').strip() or 'rxs3-' + install_id)
-                config['create_bucket'] = input('Создать этот бакет, если он отсутствует? [да/нет]: ').strip().lower() == 'да'
-                keys = run(['/usr/local/x-ui/bin/xray-linux-amd64', 'vlessenc']).stdout.decode()
-                dec = re.search(r'"decryption": "([^"]+)"', keys)
-                enc = re.search(r'"encryption": "([^"]+)"', keys)
-                if not dec or not enc: raise ManagerError('Не удалось создать VLESS Encryption')
-                config['decryption'] = dec.group(1)
-                config['encryption'] = enc.group(1).replace('.0rtt.', '.1rtt.')
-                config['decryption_sha256'] = hashlib.sha256(config['decryption'].encode()).hexdigest()
-                atomic_json(pending, config)  # Before cloud/panel resource mutation.
+                if run([PANEL_BINARY, '-v']).stdout.strip() != b'3.9.0':
+                    raise ManagerError('Нужна обычная локальная 3x-ui ровно версии 3.9.0')
+                config = {'installation': secrets.token_hex(12),
+                          'fresh': (HOME / 'fresh-panel-pending').is_file(), 'format': 1,
+                          'setup_stage': 'questions'}
+                atomic_json(pending, config)  # Before the first question, not after all secrets.
+            if edit_vk:
+                for field in ('accessKey', 'secretKey', 'bucket', 'create_bucket', 'last_vk_error'):
+                    config.pop(field, None)
+                config['setup_stage'] = 'questions'
+                atomic_json(pending, config)
+                print('Введите параметры VK заново. Панель, её порты и уже созданные бакеты не удаляются.')
+            collect_settings(config, pending)
             if config['fresh']:
                 if not config.get('bootstrap_complete'):
                     private_dir('/etc/x-ui')
@@ -181,13 +264,27 @@ def setup():
                     break
                 except RemoteError: time.sleep(.1)
             else: raise ManagerError('Панель недоступна')
+            config['setup_stage'] = 'cloud'
+            atomic_json(pending, config)
             cloud = S3(config['endpoint'], config['bucket'], config['accessKey'], config['secretKey'])
-            try: cloud.call('HEAD')
-            except RemoteError as error:
-                if error.status != 404 or not config['create_bucket']: raise
-                cloud.create_bucket()
-            cloud.check_bucket()
-            cloud.list_keys()  # Validate real PAK contract before issuing users.
+            print('Проверка VK: доступ к бакету, приватность и управление пользовательскими ключами...')
+            try:
+                cloud.check_account()
+                try: cloud.call('HEAD')
+                except RemoteError as error:
+                    # 403 is NOT evidence that a bucket is absent. Never PUT on 403.
+                    if error.status != 404 or not config['create_bucket']: raise
+                    cloud.create_bucket()
+                cloud.check_bucket()
+                cloud.list_keys()
+            except CloudError as error:
+                config['last_vk_error'] = {'operation': error.operation, 'status': error.status, 'code': error.code}
+                atomic_json(pending, config)
+                raise ManagerError(str(error) + '\n' + error.hint() +
+                    '\nНастройки сохранены. Повторить: sudo rxs3 setup. Исправить параметры VK: sudo rxs3 setup --edit-vk') from None
+            config.pop('last_vk_error', None)
+            config['setup_stage'] = 'inbound'
+            atomic_json(pending, config)
             remark = 'RXS3 ' + config['installation']
             matches = [row for row in inbounds if row.get('remark') == remark]
             if len(matches) > 1: raise ManagerError('Найдены дубликаты управляемого inbound')
@@ -206,6 +303,7 @@ def setup():
             atomic_json(pending, config)
             from .engine import Engine
             Engine(store, config, panel, cloud, None).check_inbound()
+            config['setup_stage'] = 'ready'
             atomic_json(STATE / 'config.json', config)
             run(['systemctl', 'enable', '--now', 'rxs3-sync.timer'])
             (HOME / 'fresh-panel-pending').unlink(missing_ok=True)
@@ -213,6 +311,7 @@ def setup():
             print('Настройка завершена. Секреты: /var/lib/rxs3/config.json (root, 0600).')
             if config['fresh']:
                 print('Панель доступна только через SSH-туннель. Адрес и пароль: sudo rxs3 panel-info')
-            print('Далее: sudo rxs3. Первый пользователь проверит реальные PAK PUT/GET/LIST/DELETE.')
+            print_ports(config)
+            print('Далее: sudo rxs3. Пользовательские префиксы и ключи создаются автоматически при добавлении пользователя.')
     finally:
         store.db.close()

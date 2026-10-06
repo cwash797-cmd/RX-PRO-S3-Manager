@@ -18,6 +18,10 @@ def build():
     files = subprocess.check_output(['git', 'ls-files', '-z'], cwd=ROOT).decode().split('\0')
     contents = {}
     for name in sorted(filter(None, files)):
+        # The online launcher pins this archive's hash. Shipping it inside the
+        # archive creates a circular hash (or embeds a stale downgrade pointer).
+        # Keep it and its own tests in Git only; install.py is the bundle entry.
+        if name in ('get.sh', 'tests/test_download.py'): continue
         if name.startswith(('.lab/', '.git/')) or name.endswith(('.sqlite', '.db', '.rxs3-backup')):
             raise SystemExit('Forbidden state file in source tree')
         path = ROOT / name

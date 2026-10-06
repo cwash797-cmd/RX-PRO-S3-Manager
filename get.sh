@@ -2,9 +2,9 @@
 # Download the tested release, not an untested branch. Never request GitHub tokens.
 set -Eeuo pipefail
 
-RXS3_VERSION='0.1.0-rc1'
+RXS3_VERSION='0.1.0-rc2'
 ARCHIVE="rx-pro-s3-manager-${RXS3_VERSION}.tar.gz"
-SHA256='512b35fc1d1f7b020eb9eae8f9667fc25ccbd7de503ab02215a239ce3ab32fd5'
+SHA256='8b6a9aadbc17c21d8b651918785b91df0284b54ead2b0728cc06a9fdf1b167cb'
 URL="https://github.com/cwash797-cmd/RX-PRO-S3-Manager/releases/download/v${RXS3_VERSION}/${ARCHIVE}"
 mode='fresh'
 destination=''
@@ -34,9 +34,23 @@ if [[ "$mode" != download ]]; then
         *) echo 'Нужны Ubuntu 22.04/24.04 или Debian 12.' >&2; exit 1 ;;
     esac
     [[ -d /run/systemd/system ]] || { echo 'Нужен systemd, не Docker.' >&2; exit 1; }
-    if [[ "$mode" == fresh ]] && { [[ -e /usr/local/x-ui ]] || [[ -e /etc/x-ui ]]; }; then
-        echo 'Панель уже существует. Для подключения используйте --existing-panel.' >&2
-        exit 1
+    if [[ "$mode" == fresh ]]; then
+        if [[ -f /opt/rxs3/.rxs3-managed && ! -L /opt/rxs3/.rxs3-managed ]] && \
+            { [[ -e /usr/local/x-ui ]] || [[ -e /var/lib/rxs3/config.json ]] || [[ -e /var/lib/rxs3/setup.json ]]; }; then
+            mode='existing'
+            if [[ -f /var/lib/rxs3/config.json ]]; then
+                echo 'Найден установленный менеджер. Обновим его файлы; панель и данные сохраняются.'
+            else
+                echo 'Найдена незавершённая установка менеджера. Обновим его файлы и продолжим мастер.'
+            fi
+        elif [[ -e /usr/local/x-ui || -e /etc/x-ui ]]; then
+            echo 'Найдена существующая панель, не установленная этим менеджером. Переустанавливать её не будем.'
+            read -r -p 'Подключить её к менеджеру? [да/нет; Enter = нет]: ' answer
+            case "$answer" in
+                да|Да|yes|y) mode='existing' ;;
+                *) echo 'Ничего не изменено.'; exit 0 ;;
+            esac
+        fi
     fi
     apt-get update
     apt-get install -y python3 python3-cryptography python3-qrcode iproute2 ca-certificates curl
@@ -66,5 +80,15 @@ if [[ "$mode" == fresh ]]; then
 else
     python3 "$release/install.py"
 fi
-rxs3 setup
+if ! rxs3 setup; then
+    printf '%s\n' 'Настройка не завершена. Сервер переустанавливать не нужно.' \
+        'Продолжить: sudo rxs3 setup' \
+        'Исправить ключи/бакет VK: sudo rxs3 setup --edit-vk' \
+        'Показать состояние: sudo rxs3 status'
+    exit 1
+fi
+if [[ ! -f /var/lib/rxs3/config.json ]]; then
+    echo 'Мастер отложен. Продолжить позже: sudo rxs3 setup'
+    exit 0
+fi
 rxs3
