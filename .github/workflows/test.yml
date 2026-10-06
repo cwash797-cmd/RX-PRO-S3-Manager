@@ -1,0 +1,67 @@
+name: Manager safety and installation tests
+on:
+  push:
+    branches: [genspark_ai_developer, main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: manager-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ubuntu-install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-cryptography python3-qrcode iproute2 ca-certificates curl
+      - name: Unit and security tests
+        run: /usr/bin/python3 -m unittest discover -s tests -v
+      - name: Reproducible release and clean installation
+        run: |
+          /usr/bin/python3 build_release.py
+          mkdir -p .lab/release
+          tar -xzf dist/rx-pro-s3-manager-0.1.0-rc1.tar.gz -C .lab/release
+          cd .lab/release/rx-pro-s3-manager-0.1.0-rc1
+          sha256sum -c SHA256SUMS
+          sudo /usr/bin/python3 install.py --check
+          sudo bash -c 'umask 077; /usr/bin/python3 install.py --fresh-panel'
+      - name: Real systemd bootstrap and existing-panel compatibility (mock VK)
+        env:
+          RXS3_ALLOW_INSTALL_TEST: github-disposable-runner
+        run: sudo --preserve-env=GITHUB_ACTIONS,RXS3_ALLOW_INSTALL_TEST /usr/bin/python3 tests/installed_smoke.py
+      - name: Reinstall preserves panel and state
+        run: |
+          sudo sha256sum /var/lib/rxs3/config.json > .lab/config-before.sha
+          sudo /usr/bin/python3 .lab/release/rx-pro-s3-manager-0.1.0-rc1/install.py
+          sudo sha256sum -c .lab/config-before.sha
+          sudo rxs3 sync
+          sudo systemctl is-active x-ui rxs3-sync.timer
+      - name: Standalone real panel API contracts in private network
+        run: |
+          mkdir -p .lab/x-ui/bin
+          sudo cp /usr/local/x-ui/x-ui .lab/x-ui/x-ui
+          sudo cp /usr/local/x-ui/bin/xray-linux-amd64 .lab/x-ui/bin/
+          sudo unshare --net -- bash -c 'ip link set lo up; /usr/bin/python3 tests/integration_panel.py'
+      - name: Upload source-only test bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: manager-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+  debian-unit:
+    runs-on: ubuntu-24.04
+    container: debian:12
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update -qq && apt-get install -y python3 python3-cryptography python3-qrcode
+      - run: python3 -m unittest discover -s tests -v
