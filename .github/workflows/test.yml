@@ -29,8 +29,11 @@ jobs:
         run: |
           /usr/bin/python3 build_release.py
           mkdir -p .lab/release
-          tar -xzf dist/rx-pro-s3-manager-0.1.0-rc1.tar.gz -C .lab/release
-          cd .lab/release/rx-pro-s3-manager-0.1.0-rc1
+          version=$(/usr/bin/python3 -c 'from rxs3 import __version__; print(__version__)')
+          release="rx-pro-s3-manager-$version"
+          tar -xzf "dist/$release.tar.gz" -C .lab/release
+          echo "RXS3_RELEASE_PATH=$PWD/.lab/release/$release" >> "$GITHUB_ENV"
+          cd ".lab/release/$release"
           sha256sum -c SHA256SUMS
           sudo /usr/bin/python3 install.py --check
           sudo bash -c 'umask 077; /usr/bin/python3 install.py --fresh-panel'
@@ -41,7 +44,7 @@ jobs:
       - name: Reinstall preserves panel and state
         run: |
           sudo sha256sum /var/lib/rxs3/config.json > .lab/config-before.sha
-          sudo /usr/bin/python3 .lab/release/rx-pro-s3-manager-0.1.0-rc1/install.py
+          sudo /usr/bin/python3 "$RXS3_RELEASE_PATH/install.py" --fresh-panel
           sudo sha256sum -c .lab/config-before.sha
           sudo rxs3 sync
           sudo systemctl is-active x-ui rxs3-sync.timer

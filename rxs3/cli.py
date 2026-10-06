@@ -11,13 +11,13 @@ import time
 from . import __version__
 from .backup import backup, quarantine
 from .engine import Engine
-from .errors import ManagerError
+from .errors import ManagerError, CloudError
 from .http import Panel
 from .profiles import safe_name
 from .runtime import Runtime, run
 from .s3 import S3
 from .secure import Store, exclusive_bytes, load_private
-from .setup import STATE, setup, bootstrap
+from .setup import STATE, setup, bootstrap, setup_status, print_ports
 
 STATES = {'active': 'активен', 'disabled': 'отключён', 'deleted': 'удалён',
           'creating': 'выдача не завершена', 'revocation_pending': 'ОТЗЫВ НЕ ЗАВЕРШЁН',
@@ -71,13 +71,40 @@ def show(engine, uid, output=None, qr=False):
             code.print_ascii(invert=True)
 
 
+def print_setup_status():
+    status = setup_status()
+    labels = {'ready': 'Настройка завершена', 'pending': 'Настройка не завершена',
+              'not_configured': 'Файлы установлены; первичная настройка ещё не выполнена'}
+    print(labels[status['state']])
+    stages = {'questions': 'ввод параметров', 'panel': 'подготовка панели', 'cloud': 'проверка VK',
+              'inbound': 'создание локального входа', 'ready': 'готово', 'legacy': 'сохранённая настройка rc1'}
+    print('Этап:', stages.get(status.get('stage'), 'требуется проверка'))
+    print('Продолжить:', status['next_command'])
+    if type(status.get('web_port')) is int:
+        print(f"Сохранённый локальный порт панели: 127.0.0.1:{status['web_port']}/TCP")
+    if type(status.get('panel_port')) is int:
+        print(f"Сохранённый локальный порт S3-входа: 127.0.0.1:{status['panel_port']}/TCP")
+    if status['state'] != 'ready':
+        print('Исправить сохранённые ключи/бакет VK: sudo rxs3 setup --edit-vk')
+        print('Переустанавливать сервер или удалять файлы менеджера не нужно.')
+    if status.get('last_vk_error'):
+        error = status['last_vk_error']
+        print('Последний отказ VK:', error.get('operation'), 'HTTP', error.get('status'), error.get('code') or '')
+    return status
+
+
 def diagnosis(engine):
     checks = {}
+    failures = {}
     for name, action in [('panel_api', engine.panel.clients), ('managed_inbound', engine.check_inbound),
                          ('private_bucket', engine.cloud.check_bucket), ('pak_api', engine.cloud.list_keys)]:
         try:
             action()
             checks[name] = 'ok'
+        except CloudError as error:
+            checks[name] = 'failed'
+            failures[name] = {'operation': error.operation, 'http_status': error.status,
+                              'code': error.code, 'hint': error.hint()}
         except Exception: checks[name] = 'failed'
     try:
         checks['sync_timer'] = 'ok' if run(['systemctl', 'is-active', '--quiet', 'rxs3-sync.timer'], check=False).returncode == 0 else 'failed'
@@ -91,7 +118,7 @@ def diagnosis(engine):
                 if not engine.runtime.active(row['id']): bridges += 1
             except ManagerError: bridges += 1
     report = {'manager_version': __version__, 'time_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              'checks': checks, 'counts': counts, 'inactive_bridges': bridges,
+              'checks': checks, 'failures': failures, 'counts': counts, 'inactive_bridges': bridges,
               'note': 'Проверка не измеряет S3 billing и не доказывает доступность Android/БС'}
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return all(value == 'ok' for value in checks.values()) and not bridges
@@ -104,7 +131,7 @@ def menu(engine):
               '4. Отключить\n5. Включить с новой ссылкой\n6. Перевыпустить доступ\n'
               '7. Удалить доступ\n8. Синхронизация / восстановление\n9. Диагностика\n'
               '10. Зашифрованная резервная копия\n11. Очистить объекты отключённого пользователя\n'
-              '12. Обновление менеджера\n0. Выход')
+              '12. Обновление менеджера\n13. Порты и совместимость\n0. Выход')
         choice = input('Выберите пункт: ').strip()
         try:
             if choice == '0': return
@@ -143,23 +170,27 @@ def menu(engine):
                 if input('Удалить объекты только этого отключённого пользователя? Введите ОЧИСТИТЬ: ') == 'ОЧИСТИТЬ':
                     print('Удалено объектов:', engine.purge(uid))
             elif choice == '12': update_help()
+            elif choice == '13': print_ports(engine.config)
             else: print('Неизвестный пункт.')
         except ManagerError as error: print('Ошибка:', error)
         except (ValueError, OSError): print('Некорректный ввод или ошибка локального ввода/вывода.')
 
 
 def update_help():
-    print('Обновление только из нового проверенного release-архива этого приватного репозитория.')
-    print('1. Сделайте зашифрованную резервную копию.\n2. Скачайте релиз через авторизованный браузер и скопируйте на VPS.\n'
-          '3. Проверьте SHA256, распакуйте и выполните sudo python3 install.py БЕЗ --fresh-panel.\n'
-          '4. Выполните sudo rxs3 sync и sudo rxs3 diagnose. Версии 3x-ui и RX-PRO автоматически не обновляются.')
+    print('1. Для настроенной установки сделайте зашифрованную резервную копию.')
+    print('2. Повторите целиком блок установки из публичной инструкции:')
+    print('https://github.com/cwash797-cmd/RX-PRO-S3-Manager#readme')
+    print('Загрузчик распознает этот менеджер, обновит только его файлы и продолжит настройку.')
+    print('Существующая панель, её конфигурации и бакеты не переустанавливаются.')
 
 
 def main():
     parser = argparse.ArgumentParser(description='RX-PRO S3 Manager — приватный терминальный менеджер')
     parser.add_argument('--version', action='version', version=__version__)
     sub = parser.add_subparsers(dest='command')
-    for name in ('setup', 'list', 'sync', 'diagnose', 'panel-info', 'update', '_bootstrap'):
+    configure = sub.add_parser('setup', help='Продолжить первичную настройку')
+    configure.add_argument('--edit-vk', action='store_true', help='Заново ввести ключи и бакет до завершения настройки')
+    for name in ('status', 'ports', 'list', 'sync', 'diagnose', 'panel-info', 'update', '_bootstrap'):
         sub.add_parser(name)
     add = sub.add_parser('add')
     add.add_argument('name')
@@ -178,7 +209,8 @@ def main():
     args = parser.parse_args()
     if os.geteuid() != 0: raise ManagerError('Запустите через sudo')
     os.umask(0o077)
-    if args.command == 'setup': return setup()
+    if args.command == 'setup': return setup(edit_vk=args.edit_vk)
+    if args.command == 'status': return print_setup_status()
     if args.command == '_bootstrap': return bootstrap()
     if args.command == 'update': return update_help()
     if args.command == 'restore-quarantine':
@@ -186,7 +218,16 @@ def main():
         print('Записей восстановлено в ОФЛАЙН-КАРАНТИН:', count)
         print('Ничего не включено. Не копируйте каталог поверх живого реестра: старой копии неизвестны новые ключи.')
         return
+    if setup_status()['state'] != 'ready':
+        print_setup_status()
+        if args.command is None and sys.stdin.isatty():
+            print('Продолжаем мастер с первого несохранённого шага.')
+            setup()
+            if setup_status()['state'] != 'ready': return
+        else:
+            raise ManagerError('Сначала завершите мастер: sudo rxs3 setup')
     config = load_private(STATE / 'config.json')
+    if args.command == 'ports': return print_ports(config)
     if args.command == 'panel-info':
         if not sys.stdout.isatty(): raise ManagerError('Реквизиты показываются только в терминале')
         if not config.get('fresh'): raise ManagerError('Пароль существующей панели менеджер не хранит')
@@ -223,7 +264,10 @@ def entry():
     except ManagerError as error:
         print('Ошибка:', error, file=sys.stderr)
     except (KeyboardInterrupt, EOFError):
-        print('\nОперация прервана. Перед новой выдачей выполните rxs3 sync.', file=sys.stderr)
+        try: pending = setup_status()['state'] != 'ready'
+        except ManagerError: pending = True
+        command = 'sudo rxs3 setup' if pending else 'sudo rxs3 sync'
+        print('\nОперация прервана. Продолжить безопасно: ' + command, file=sys.stderr)
     except Exception:
         print('Локальная ошибка. Секреты и traceback скрыты; выполните rxs3 diagnose и rxs3 sync.', file=sys.stderr)
     return 1

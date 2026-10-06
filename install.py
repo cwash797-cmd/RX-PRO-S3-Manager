@@ -137,7 +137,11 @@ def main():
         raise ManagerError('/opt/rxs3 занят другим приложением')
     panel_root = Path('/usr/local/x-ui')
     if args.fresh_panel and any(p.exists() for p in (panel_root, Path('/etc/x-ui'), Path('/etc/systemd/system/x-ui.service'))):
-        raise ManagerError('3x-ui уже существует; используйте подключение существующей панели')
+        if (HOME / '.rxs3-managed').is_file() and (panel_root / 'x-ui').is_file():
+            print('Панель уже установлена. Обновляем только менеджер, сохраняя панель и незавершённую настройку.')
+            args.fresh_panel = False
+        else:
+            raise ManagerError('Найдена сторонняя панель. Для подключения запустите install.py без --fresh-panel; панель не изменена.')
     if args.fresh_panel:
         run(['unshare', '--net', '--', 'true'])  # Fail BEFORE writing/installing panel.
     private_dir(STATE)

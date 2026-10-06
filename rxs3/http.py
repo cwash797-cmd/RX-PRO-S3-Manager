@@ -3,8 +3,23 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 
-from .errors import ManagerError, RemoteError
+from .errors import ManagerError, RemoteError, S3_ERROR_CODES
+
+
+def safe_s3_error(data):
+    """Discard Message, RequestId, StringToSign, credentials and unknown codes."""
+    if len(data) > 16384 or b'<!DOCTYPE' in data.upper() or b'<!ENTITY' in data.upper():
+        return b''
+    try:
+        root = ET.fromstring(data)
+        codes = [e.text for e in root.iter() if e.tag.rsplit('}', 1)[-1] == 'Code']
+        if len(codes) == 1 and codes[0] in S3_ERROR_CODES:
+            return ('<Error><Code>' + codes[0] + '</Code></Error>').encode()
+    except (ET.ParseError, ValueError):
+        pass
+    return b''
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -34,7 +49,11 @@ def request(url, method='GET', headers=None, body=None, system='HTTP', timeout=2
             if len(data) > 4 * 1024 * 1024: raise RemoteError(system)
             return response.status, data
     except urllib.error.HTTPError as error:
-        return error.code, b''  # Response bodies can contain credentials/canonical requests.
+        try:
+            data = safe_s3_error(error.read(16385)) if system == 'VK S3' else b''
+            return error.code, data
+        finally:
+            error.close()
     except (OSError, ValueError, urllib.error.URLError):
         raise RemoteError(system) from None
 
