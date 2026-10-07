@@ -23,6 +23,30 @@ class DownloadTest(unittest.TestCase):
         return subprocess.run(['bash', str(SCRIPT), *args], env=self.env,
                               stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
 
+    def test_upgrade_failure_stops_before_menu_and_is_retryable(self):
+        tail = SCRIPT.read_text().split('if ! rxs3 apply-upgrade --yes; then', 1)[1]
+        tail = 'if ! rxs3 apply-upgrade --yes; then' + tail
+        function = 'rxs3() { if [[ $# -eq 0 ]]; then echo MENU_OPENED; else echo "$*"; return "$UPGRADE_RESULT"; fi; }; '
+        for code in (0, 1):
+            result = subprocess.run(['bash', '-c', function + tail], capture_output=True, text=True,
+                                    env=dict(self.env, UPGRADE_RESULT=str(code)))
+            self.assertEqual(result.returncode, code)
+            self.assertIn('apply-upgrade --yes', result.stdout)
+            self.assertEqual('MENU_OPENED' in result.stdout, code == 0)
+            if code: self.assertIn('Успех не подтверждён', result.stdout)
+
+    def test_existing_upgrade_requires_explicit_confirmation(self):
+        text = SCRIPT.read_text()
+        start = text.index('    if [[ -f /var/lib/rxs3/config.json ]]; then\n        echo')
+        block = text[start:text.index('    apt-get update', start)]
+        # Evaluate the actual confirmation block without touching production paths.
+        block = block.replace('[[ -f /var/lib/rxs3/config.json ]]', 'true')
+        for answer, proceeds in (('\n', False), ('нет\n', False), ('да\n', True)):
+            result = subprocess.run(['bash', '-c', block + 'echo INSTALL_CONTINUES'], input=answer,
+                                    capture_output=True, text=True, env=self.env)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual('INSTALL_CONTINUES' in result.stdout, proceeds)
+
     def test_help_and_shell_syntax(self):
         self.assertEqual(subprocess.run(['bash', '-n', str(SCRIPT)]).returncode, 0)
         self.assertEqual(self.run_script('--help').returncode, 0)

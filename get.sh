@@ -2,9 +2,9 @@
 # Download the tested release, not an untested branch. Never request GitHub tokens.
 set -Eeuo pipefail
 
-RXS3_VERSION='0.1.0-rc2'
+RXS3_VERSION='0.1.0-rc3'
 ARCHIVE="rx-pro-s3-manager-${RXS3_VERSION}.tar.gz"
-SHA256='8b6a9aadbc17c21d8b651918785b91df0284b54ead2b0728cc06a9fdf1b167cb'
+SHA256='607994b65244b7f4cd3dfa86c3f452c4b0539601905712955088e53f09f38950'
 URL="https://github.com/cwash797-cmd/RX-PRO-S3-Manager/releases/download/v${RXS3_VERSION}/${ARCHIVE}"
 mode='fresh'
 destination=''
@@ -52,6 +52,15 @@ if [[ "$mode" != download ]]; then
             esac
         fi
     fi
+    if [[ -f /var/lib/rxs3/config.json ]]; then
+        echo 'Обновление сохранит ссылки, ключи и лимиты. Сделайте копию менеджера и базы панели.'
+        echo 'Будут применены метаданные панели и новый bridge; возможны краткие переподключения.'
+        read -r -p 'Продолжить обновление? [да/нет; Enter = нет]: ' answer
+        case "$answer" in
+            да|Да|yes|y) ;;
+            *) echo 'Ничего не изменено.'; exit 0 ;;
+        esac
+    fi
     apt-get update
     apt-get install -y python3 python3-cryptography python3-qrcode iproute2 ca-certificates curl
 else
@@ -61,7 +70,7 @@ command -v curl >/dev/null || { echo 'Сначала установите curl �
 umask 077
 work=$(mktemp -d "${TMPDIR:-/tmp}/rxs3-download.XXXXXXXX")
 trap 'rm -rf -- "$work"' EXIT
-printf 'Скачивание проверенного тестового релиза %s...\n' "$RXS3_VERSION"
+printf 'Скачивание проверенного предварительного выпуска %s...\n' "$RXS3_VERSION"
 curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
     --connect-timeout 15 --max-time 300 --max-filesize 10000000 "$URL" -o "$work/$ARCHIVE"
 printf '%s  %s\n' "$SHA256" "$work/$ARCHIVE" | sha256sum -c -
@@ -90,5 +99,11 @@ fi
 if [[ ! -f /var/lib/rxs3/config.json ]]; then
     echo 'Мастер отложен. Продолжить позже: sudo rxs3 setup'
     exit 0
+fi
+if ! rxs3 apply-upgrade --yes; then
+    printf '%s\n' 'Файлы обновлены, но миграция не завершена. Успех не подтверждён.' \
+        'После устранения ошибки повторите: sudo rxs3 apply-upgrade --yes' \
+        'Диагностика: sudo rxs3 diagnose'
+    exit 1
 fi
 rxs3
