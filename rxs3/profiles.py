@@ -72,17 +72,17 @@ def profile(link, client, server, panel_port, encryption_override=None):
         raise ValueError("Client prefix must be within server scope")
     prefix = client["prefix"].rstrip("/")
 
-    def stream(storage):
+    def stream(storage, ttl=300):
         creds = {k: v for k, v in storage.items() if k != "prefix"}
         return {"network": "xdrive", "security": "none", "xdriveSettings": {
             "service": "S3", "remoteFolder": prefix, "secrets": [json.dumps(creds, separators=(",", ":"))],
             "segmentBytes": 262144, "flushIntervalMs": 30, "pollIntervalMs": 150,
-            "maxPollIntervalMs": 1200, "concurrency": 4, "sessionTtlSeconds": 300}}
+            "maxPollIntervalMs": 1200, "concurrency": 4, "sessionTtlSeconds": ttl}}
 
     bridge = {"log": {"loglevel": "warning"}, "inbounds": [{"tag": "s3-input",
         "listen": "127.0.0.1", "port": 11600, "protocol": "dokodemo-door",
         "settings": {"address": "127.0.0.1", "port": panel_port, "network": "tcp"},
-        "streamSettings": stream(server)}], "outbounds": [{"protocol": "freedom", "settings": {
+        "streamSettings": stream(server, ttl=180)}], "outbounds": [{"protocol": "freedom", "settings": {
             "finalRules": [{"action": "allow", "network": "tcp", "ip": ["127.0.0.1"], "port": str(panel_port)},
                            {"action": "block"}]}}]}
     host = urllib.parse.urlsplit(client["endpoint"]).hostname

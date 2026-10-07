@@ -182,6 +182,8 @@ def update_help():
     print('https://github.com/cwash797-cmd/RX-PRO-S3-Manager#readme')
     print('Загрузчик распознает этот менеджер, обновит только его файлы и продолжит настройку.')
     print('Существующая панель, её конфигурации и бакеты не переустанавливаются.')
+    print('Обновление применяет миграцию метаданных и bridge; запланируйте краткое переподключение.')
+    print('После ручной установки архива: sudo rxs3 apply-upgrade --yes')
 
 
 def main():
@@ -192,6 +194,8 @@ def main():
     configure.add_argument('--edit-vk', action='store_true', help='Заново ввести ключи и бакет до завершения настройки')
     for name in ('status', 'ports', 'list', 'sync', 'diagnose', 'panel-info', 'update', '_bootstrap'):
         sub.add_parser(name)
+    upgrade = sub.add_parser('apply-upgrade', help='Применить миграцию; активные соединения переподключатся')
+    upgrade.add_argument('--yes', action='store_true', required=True)
     add = sub.add_parser('add')
     add.add_argument('name')
     add.add_argument('--quota-gib', type=int, default=0)
@@ -250,6 +254,9 @@ def main():
         elif cmd == 'enable': engine.enable(args.id)
         elif cmd == 'rotate': engine.enable(args.id, rotate=True)
         elif cmd == 'purge': print('Удалено объектов:', engine.purge(args.id))
+        elif cmd == 'apply-upgrade':
+            print('Обновление метаданных и bridge: активные соединения могут переподключиться.')
+            print('Изменено объектов:', engine.upgrade_runtime())
         elif cmd == 'sync': engine.sync()
         elif cmd == 'diagnose':
             if not diagnosis(engine): raise ManagerError('Диагностика обнаружила ошибки')

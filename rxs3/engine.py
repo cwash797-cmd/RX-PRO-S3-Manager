@@ -15,6 +15,7 @@ from .errors import ManagerError, RemoteError
 from .profiles import profile, safe_name
 from .http import managed_comment
 from .secure import identifier
+from .pins import CORE_RUNTIME_REVISION
 
 
 class Engine:
@@ -61,32 +62,55 @@ class Engine:
     def repair_panel(self):
         """Fill display metadata only. Never rotate identities or regenerate keys."""
         with self.store.locked():
-            inbound = self.check_inbound()
-            settings = inbound['settings']
-            if isinstance(settings, str): settings = json.loads(settings)
-            shown = settings.get('encryption')
-            if shown not in (None, '', 'none', self.config['encryption']):
-                raise ManagerError('Публичный ключ в панели отличается; автоматическая замена запрещена')
-            changed = 0
-            if shown != self.config['encryption']:
-                self.panel.set_inbound_encryption(inbound, self.config['encryption'])
-                current = self.check_inbound()['settings']
-                if isinstance(current, str): current = json.loads(current)
-                if current.get('encryption') != self.config['encryption']:
-                    raise ManagerError('Панель не подтвердила публичный ключ')
+            return self._repair_panel()
+
+    def _repair_panel(self):
+        inbound = self.check_inbound()
+        settings = inbound['settings']
+        if isinstance(settings, str): settings = json.loads(settings)
+        shown = settings.get('encryption')
+        if shown not in (None, '', 'none', self.config['encryption']):
+            raise ManagerError('Публичный ключ в панели отличается; автоматическая замена запрещена')
+        changed = 0
+        if shown != self.config['encryption']:
+            self.panel.set_inbound_encryption(inbound, self.config['encryption'])
+            current = self.check_inbound()['settings']
+            if isinstance(current, str): current = json.loads(current)
+            if current.get('encryption') != self.config['encryption']:
+                raise ManagerError('Панель не подтвердила публичный ключ')
+            changed += 1
+        for user in self.store.users():
+            if user['state'] == 'deleted': continue
+            record = self.panel.client(user['email'])
+            if record is None: continue
+            self.owned(record, user)
+            if record['client']['comment'] != managed_comment(user):
+                self.panel.update_client(record, comment=managed_comment(user))
+                updated = self.panel.client(user['email'])
+                self.owned(updated, user)
+                if updated is None or updated['client']['comment'] != managed_comment(user):
+                    raise ManagerError('Панель не подтвердила имя пользователя')
                 changed += 1
+        return changed
+
+    def upgrade_runtime(self):
+        """Operator-triggered, idempotent upgrade; active streams may reconnect."""
+        if CORE_RUNTIME_REVISION < 3:
+            raise ManagerError('Сервер с watchdog ещё не включён в закреплённый выпуск; миграция runtime запрещена')
+        with self.store.locked():
+            changed = self._repair_panel()
             for user in self.store.users():
-                if user['state'] == 'deleted': continue
+                if user['state'] != 'active' or user['desired'] != 'active': continue
                 record = self.panel.client(user['email'])
-                if record is None: continue
                 self.owned(record, user)
-                if record['client']['comment'] != managed_comment(user):
-                    self.panel.update_client(record, comment=managed_comment(user))
-                    updated = self.panel.client(user['email'])
-                    self.owned(updated, user)
-                    if updated is None or updated['client']['comment'] != managed_comment(user):
-                        raise ManagerError('Панель не подтвердила имя пользователя')
-                    changed += 1
+                if not self.allowed(record): continue
+                if user.get('runtime_revision') == 3: continue
+                self.check_inbound()
+                _, bridge = self._profile(user, user['generations'][-1])
+                self.runtime.start(user['id'], bridge)
+                user['runtime_revision'] = 3
+                self.save(user, 'runtime_upgraded')
+                changed += 1
             return changed
 
     @staticmethod
@@ -156,7 +180,7 @@ class Engine:
             if record['client']['uuid'] != user['uuid']:
                 raise ManagerError('Панель не подтвердила новый UUID')
             user.pop('previous_uuid', None)
-            user.update(state='active', desired='active')
+            user.update(state='active', desired='active', runtime_revision=CORE_RUNTIME_REVISION)
             self.save(user, 'activated')
         except Exception:
             # Catch local IO failures too; never print credential-bearing exceptions.

@@ -184,7 +184,11 @@ def main():
     for name, value in [('rxs3-bridge@.service', BRIDGE_UNIT), ('rxs3-sync.service', SYNC_UNIT), ('rxs3-sync.timer', SYNC_TIMER)]:
         managed_text('/etc/systemd/system/' + name, value)
     run(['systemctl', 'daemon-reload'])
-    print('Файлы установлены. Панель и облако ещё не настраивались. Далее: sudo rxs3 setup')
+    if (STATE / 'config.json').is_file():
+        print('Файлы обновлены. Примените миграцию: sudo rxs3 apply-upgrade --yes')
+        print('Возможны краткие переподключения; ссылки, ключи и лимиты сохраняются.')
+    else:
+        print('Файлы установлены. Панель и облако ещё не настраивались. Далее: sudo rxs3 setup')
 
 
 if __name__ == '__main__':
