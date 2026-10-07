@@ -10,6 +10,37 @@ concurrency:
   group: manager-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  native-bridge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Native transport and S3 race suite
+        run: python3 native/build.py test
+      - name: Build server-only bridge
+        run: python3 native/build.py linux
+      - name: Verify unchanged 1.6.0 client interoperability
+        run: |
+          mkdir -p .lab/legacy
+          curl -fL --proto '=https' --proto-redir '=https' https://github.com/cwash797-cmd/RX-PRO/releases/download/1.6.0/s3_rixxx_server_linux_amd64_1.6.0.tar.gz -o .lab/legacy/client.tar.gz
+          echo '5c25988b6878a0adc0300521f2c428febc90cd52aeaa6a5b9e463fc8f1db4618  .lab/legacy/client.tar.gz' | sha256sum -c -
+          tar -xzf .lab/legacy/client.tar.gz -C .lab/legacy
+          python3 native/integration.py --client .lab/legacy/xray-s3 --server .lab/native/bin/xray-s3
+      - name: Package native bridge twice identically
+        run: |
+          python3 native/package.py
+          cp .lab/native/dist/SHA256SUMS.bridge .lab/native/expected.sha
+          python3 native/package.py
+          cmp .lab/native/expected.sha .lab/native/dist/SHA256SUMS.bridge
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-bridge-linux-amd64
+          path: .lab/native/dist/*
+          if-no-files-found: error
   ubuntu-install:
     strategy:
       fail-fast: false
