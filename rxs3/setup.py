@@ -296,7 +296,8 @@ def setup(edit_vk=False):
                     raise ManagerError('Порт уже назначен другому inbound; настройка остановлена')
                 inbound = panel.call('inbounds/add', {'remark': remark, 'enable': True,
                     'listen': '127.0.0.1', 'port': config['panel_port'], 'protocol': 'vless',
-                    'settings': {'clients': [], 'decryption': config['decryption']},
+                    'settings': {'clients': [], 'decryption': config['decryption'],
+                                 'encryption': config['encryption']},
                     'streamSettings': {'network': 'tcp', 'security': 'none'},
                     'sniffing': {'enabled': False}})
                 config['inbound_id'] = inbound['id']

@@ -4,6 +4,10 @@ Tests actual installation, bootstrap, systemd credentials and attach-existing.
 VK is explicitly a mock here; this is NOT a real VK end-to-end test.
 """
 import os
+import copy
+import hashlib
+import shutil
+import tempfile
 from pathlib import Path
 import sys
 from unittest.mock import patch
@@ -17,7 +21,10 @@ sys.path.insert(0, str(ROOT))
 from rxs3 import setup as wizard
 from rxs3.http import Panel
 from rxs3.runtime import Runtime, run
-from rxs3.secure import load_private, atomic_json
+from rxs3.secure import load_private, atomic_json, Store
+from rxs3.engine import Engine
+from test_lifecycle import CloudFake
+from install import download, unpack
 from rxs3.errors import CloudError, ManagerError
 
 
@@ -32,6 +39,82 @@ class MockCloud:
 
 def require(condition, message):
     if not condition: raise RuntimeError(message)
+
+
+def upgrade_smoke(config, panel):
+    """Original rc2 core + rc2-format records -> new install + real systemd restart.
+    Cloud management is a model; the native S3 endpoint is closed loopback only.
+    """
+    run(['systemctl', 'stop', 'rxs3-sync.timer', 'rxs3-sync.service'])
+    core = Path('/opt/rxs3/bin/xray-s3')
+    current_hash = hashlib.sha256(core.read_bytes()).hexdigest()
+    runtime = Runtime()
+    store = Store('/var/lib/rxs3')
+    cloud = CloudFake(); cloud.endpoint = 'https://127.0.0.1:9'
+    engine = Engine(store, config, panel, cloud, runtime)
+    def pid(uid):
+        return run(['systemctl', 'show', '-p', 'MainPID', '--value', runtime.unit(uid)]).stdout.decode().strip()
+    def executable_hash(process):
+        return hashlib.sha256(Path('/proc/' + process + '/exe').read_bytes()).hexdigest()
+    with tempfile.TemporaryDirectory(dir=ROOT / '.lab', prefix='upgrade-') as tmp:
+        work = Path(tmp)
+        backup = work / 'guarded-core'; shutil.copy2(core, backup)
+        ids = []
+        try:
+            download('https://github.com/cwash797-cmd/RX-PRO/releases/download/1.6.0/s3_rixxx_server_linux_amd64_1.6.0.tar.gz',
+                     '5c25988b6878a0adc0300521f2c428febc90cd52aeaa6a5b9e463fc8f1db4618', work / 'old.tar.gz')
+            (work / 'old').mkdir(); unpack(work / 'old.tar.gz', work / 'old')
+            replacement = core.with_name('fixture-core.new')
+            shutil.copy2(work / 'old/xray-s3', replacement); replacement.chmod(0o755)
+            os.replace(replacement, core)
+            old_hash = hashlib.sha256(core.read_bytes()).hexdigest()
+            require(old_hash != current_hash, 'Fixture must use the actual old core')
+            for name in ('upgrade-active', 'upgrade-disabled'):
+                ids.append(engine.add(name, 1024**3, 4102444800000))
+            a, b = ids
+            engine.disable(b)
+            for uid in ids:
+                user = store.get(uid); user.pop('runtime_revision', None)
+                store.put(user, 'legacy_fixture')
+                panel.update_client(panel.client(user['email']), comment='RXS3 managed')
+            panel.set_inbound_encryption(engine.check_inbound(), 'none')
+            legacy_config = load_private('/var/lib/rxs3/runtime/' + a + '.json')
+            legacy_config['inbounds'][0]['streamSettings']['xdriveSettings']['sessionTtlSeconds'] = 300
+            runtime.start(a, legacy_config)
+            old_pid = pid(a)
+            require(executable_hash(old_pid) == old_hash, 'Old service binary not actually running')
+            link, keys = engine.show(a), copy.deepcopy(cloud.keys)
+            saved_config = Path('/var/lib/rxs3/config.json').read_bytes()
+            # Real installer atomically replaces the binary without losing state.
+            run(['/usr/bin/python3', '/opt/rxs3/current/install.py', '--fresh-panel'], timeout=360)
+            require(Path('/var/lib/rxs3/config.json').read_bytes() == saved_config, 'Reinstall changed credentials')
+            require(hashlib.sha256(core.read_bytes()).hexdigest() == current_hash, 'New core was not installed')
+            require(executable_hash(pid(a)) == old_hash, 'Installer unexpectedly killed old session')
+            require(engine.upgrade_runtime() == 4, 'Expected public key, two names and active bridge migration')
+            new_pid = pid(a)
+            require(new_pid != old_pid and runtime.active(a), 'Active bridge did not restart')
+            require(executable_hash(new_pid) == current_hash, 'Service still runs the old core')
+            upgraded = load_private('/var/lib/rxs3/runtime/' + a + '.json')
+            require(upgraded['inbounds'][0]['streamSettings']['xdriveSettings']['sessionTtlSeconds'] == 180,
+                    'Server watchdog timeout was not migrated')
+            require(engine.show(a) == link and cloud.keys == keys, 'Upgrade rotated credentials or link')
+            require(not runtime.active(b) and store.get(b)['state'] == 'disabled', 'Disabled access resurrected')
+            row = panel.client(store.get(a)['email'])['client']
+            require(row['totalGB'] == 1024**3 and row['expiryTime'] == 4102444800000, 'Limits changed')
+            require(engine.upgrade_runtime() == 0 and pid(a) == new_pid, 'Repeated upgrade restarted service')
+            print('PASS: original rc2 core/records -> real reinstall, guarded restart, preserved links/limits and idempotence')
+        finally:
+            for uid in ids:
+                engine.disable(uid, delete=True)
+            store.db.close()
+            # Restore the new binary even if a test assertion fails.
+            replacement = core.with_name('fixture-core.new')
+            shutil.copy2(backup, replacement); replacement.chmod(0o755)
+            os.replace(replacement, core)
+            run(['systemctl', 'start', 'rxs3-sync.timer'])
+    # Production CLI entry point, with only deleted fixtures left; no cloud calls.
+    require(b'0' in run(['/usr/local/bin/rxs3', 'apply-upgrade', '--yes']).stdout,
+            'Installed migration command failed')
 
 
 def main():
@@ -109,7 +192,7 @@ def main():
         'streamSettings': {'network': 'ws', 'security': 'none', 'wsSettings': {'path': '/existing'}},
         'sniffing': {'enabled': False}})
     before = panel.inbounds()
-    # No user was ever issued. Only this test's own manager setup is removed.
+    # No users issued yet: this fixture can safely exercise initial attachment.
     Path('/var/lib/rxs3/config.json').unlink()
     with patch.object(wizard, 'S3', MockCloud), patch.object(wizard, 'secret', side_effect=[config['panel_token'], 'fixture-access', 'fixture-secret']), \
             patch('builtins.input', side_effect=[config['panel_url'], '17181', 'other-fixture-bucket', 'нет']):
@@ -122,6 +205,7 @@ def main():
     require(any(row['id'] == unrelated['id'] for row in after), 'Existing configuration disappeared')
     require(panel.call('setting/all', {}) == settings, 'Attach-existing changed panel settings')
     print('PASS: attach-existing preserves previous inbounds and panel settings')
+    upgrade_smoke(load_private('/var/lib/rxs3/config.json'), panel)
 
 
 if __name__ == '__main__':
