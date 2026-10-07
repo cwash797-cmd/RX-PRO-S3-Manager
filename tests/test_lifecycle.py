@@ -3,6 +3,7 @@ import hashlib
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from rxs3.engine import Engine
 from rxs3.errors import ManagerError
@@ -18,13 +19,17 @@ class Crash(BaseException):
 class PanelFake:
     def __init__(self, config):
         self.config, self.rows, self.fail, self.crash = config, {}, False, False
+        self.encryption = None
 
     def inbounds(self):
         if self.fail: raise ManagerError('panel offline')
         return [{'id': 1, 'enable': True, 'listen': '127.0.0.1', 'port': 10001,
                  'remark': 'RXS3 ' + self.config['installation'], 'protocol': 'vless',
-                 'settings': {'decryption': 'fixture-key'},
+                 'settings': {'decryption': 'fixture-key', 'encryption': self.encryption},
                  'streamSettings': {'network': 'tcp', 'security': 'none'}}]
+
+    def set_inbound_encryption(self, record, encryption):
+        self.encryption = encryption
 
     def client(self, email):
         if self.fail: raise ManagerError('panel offline')
@@ -87,8 +92,10 @@ class CloudFake:
 class RuntimeFake:
     def __init__(self):
         self.running, self.fail_stop, self.crash_start = {}, False, False
+        self.starts = []
 
     def start(self, uid, config):
+        self.starts.append(uid)
         self.running[uid] = config
         if self.crash_start: raise Crash()
 
@@ -99,6 +106,8 @@ class RuntimeFake:
 
 class LifecycleTest(unittest.TestCase):
     def setUp(self):
+        revision = patch('rxs3.engine.CORE_RUNTIME_REVISION', 3)
+        revision.start(); self.addCleanup(revision.stop)
         (ROOT / '.lab').mkdir(exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(dir=ROOT / '.lab')
         self.store = Store(self.tmp.name)
@@ -114,6 +123,75 @@ class LifecycleTest(unittest.TestCase):
 
     def user(self, uid):
         return self.store.get(uid)
+
+    def legacy(self, uid):
+        user = self.user(uid)
+        user.pop('runtime_revision', None)
+        self.store.put(user, 'legacy_fixture')
+        return user
+
+    def test_upgrade_rejects_unreleased_native_pin(self):
+        uid = self.engine.add('Тест'); self.legacy(uid)
+        with patch('rxs3.engine.CORE_RUNTIME_REVISION', 2):
+            with self.assertRaises(ManagerError): self.engine.upgrade_runtime()
+        self.assertNotIn('runtime_revision', self.user(uid))
+        self.assertIsNone(self.panel.encryption)
+
+    def test_upgrade_preserves_access_and_is_idempotent(self):
+        uid = self.engine.add('testvasya', 1024**3, 4102444800000)
+        user = self.legacy(uid)
+        link, keys = self.engine.show(uid), copy.deepcopy(self.cloud.keys)
+        before = copy.deepcopy(self.panel.rows)
+        self.assertEqual(self.engine.upgrade_runtime(), 3)
+        self.assertEqual(self.engine.upgrade_runtime(), 0)
+        self.assertEqual(self.engine.show(uid), link)
+        self.assertEqual(self.cloud.keys, keys)
+        self.assertEqual(self.user(uid)['generations'], user['generations'])
+        changed = copy.deepcopy(self.panel.rows)
+        changed[user['email']]['client']['comment'] = 'RXS3 managed'
+        self.assertEqual(changed, before)
+        self.assertEqual(self.runtime.starts.count(uid), 2)
+        self.assertEqual(self.panel.encryption, self.config['encryption'])
+        self.assertEqual(self.panel.rows[user['email']]['client']['comment'], 'RXS3 managed | testvasya')
+        settings = self.runtime.running[uid]['inbounds'][0]['streamSettings']['xdriveSettings']
+        self.assertEqual(settings['sessionTtlSeconds'], 180)
+
+    def test_upgrade_never_restarts_ineligible_users(self):
+        for kind in ('disabled', 'deleted', 'panel_disabled', 'expired', 'quota', 'pending'):
+            uid = self.engine.add(kind)
+            user = self.legacy(uid)
+            if kind in ('disabled', 'deleted'):
+                self.engine.disable(uid, delete=kind == 'deleted')
+            elif kind == 'pending':
+                user['desired'] = 'disabled'; self.store.put(user, 'disable_intent')
+            else:
+                row = self.panel.rows[user['email']]
+                if kind == 'panel_disabled': row['client']['enable'] = False
+                if kind == 'expired': row['client']['expiryTime'] = 1
+                if kind == 'quota': row['client']['totalGB'] = 1; row['usedTraffic'] = 1
+        self.runtime.starts.clear()
+        self.engine.upgrade_runtime()
+        self.assertEqual(self.runtime.starts, [])
+
+    def test_upgrade_rejects_conflicting_public_key_or_identity(self):
+        uid = self.engine.add('Тест'); user = self.legacy(uid)
+        self.panel.encryption = 'another-key'
+        with self.assertRaises(ManagerError): self.engine.upgrade_runtime()
+        self.assertEqual(self.panel.encryption, 'another-key')
+        self.panel.encryption = None
+        self.panel.rows[user['email']]['client']['comment'] = 'unrelated owner'
+        with self.assertRaises(ManagerError): self.engine.upgrade_runtime()
+        self.assertEqual(self.runtime.starts.count(uid), 1)
+        self.assertNotIn('runtime_revision', self.user(uid))
+
+    def test_upgrade_interrupted_restart_is_retried(self):
+        uid = self.engine.add('Тест'); self.legacy(uid)
+        self.runtime.crash_start = True
+        with self.assertRaises(Crash): self.engine.upgrade_runtime()
+        self.assertNotIn('runtime_revision', self.user(uid))
+        self.runtime.crash_start = False
+        self.assertEqual(self.engine.upgrade_runtime(), 1)
+        self.assertEqual(self.engine.upgrade_runtime(), 0)
 
     def test_two_users_isolated_and_independently_revoked(self):
         first, second = self.engine.add('Первый'), self.engine.add('Второй')

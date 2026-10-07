@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import uuid
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -93,7 +94,7 @@ def main():
             check(isinstance(inbound, dict) and isinstance(inbound.get('id'), int), 'Invalid inbound result')
             users = []
             for index in range(2):
-                user = {'email': f'rxs3-fixture-{index}', 'uuid': str(uuid.uuid4()),
+                user = {'name': f'Fixture {index}', 'email': f'rxs3-fixture-{index}', 'uuid': str(uuid.uuid4()),
                         'sub_id': secrets.token_hex(8), 'quota': 1073741824, 'expires': 0}
                 panel.create_client(user, inbound['id'])
                 users.append(user)
@@ -123,6 +124,34 @@ def main():
                 a, b = engine.add('Первый', 1024**3), engine.add('Второй')
                 check(len(cloud.keys) == 4, 'Manager did not create isolated credentials')
                 original = engine.show(a)
+                # Emulate rc2 metadata, including a disabled client with limits.
+                for uid in (a, b):
+                    panel.update_client(panel.client(store.get(uid)['email']), comment='RXS3 managed')
+                    user = store.get(uid); user.pop('runtime_revision', None)
+                    store.put(user, 'legacy_fixture')
+                panel.update_client(panel.client(store.get(b)['email']), enable=False, totalGB=987654,
+                                    expiryTime=4102444800000)
+                before = {row['client']['email']: row for row in panel.clients()}
+                keys_before = dict(cloud.keys)
+                # Runtime is explicitly a model here; the native pin is gated until publication.
+                with patch('rxs3.engine.CORE_RUNTIME_REVISION', 3):
+                    check(engine.upgrade_runtime() == 4, 'Expected key, two names and one bridge migration')
+                    check(engine.upgrade_runtime() == 0, 'Migration is not idempotent')
+                check(engine.show(a) == original and cloud.keys == keys_before, 'Migration rotated access')
+                for row in panel.clients():
+                    previous = before[row['client']['email']]
+                    for field in ('uuid', 'email', 'subId', 'enable', 'totalGB', 'expiryTime'):
+                        check(row['client'].get(field) == previous['client'].get(field), 'Migration changed '+field)
+                    check(row['inboundIds'] == previous['inboundIds'], 'Migration changed attachments')
+                    check(row['usedTraffic'] == previous['usedTraffic'], 'Migration reset traffic')
+                saved = engine.check_inbound()['settings']
+                if isinstance(saved, str): saved = json.loads(saved)
+                check(saved['decryption'] == decryption, 'Migration changed private key')
+                check(saved['encryption'] == config['encryption'], 'Public key not displayed')
+                check(panel.client(store.get(a)['email'])['client']['comment'] == 'RXS3 managed | Первый',
+                      'Readable name not displayed')
+                panel.update_client(panel.client(store.get(b)['email']), enable=True)
+                print('PASS: real metadata migration preserves keys, links, clients, limits and disabled state')
                 engine.disable(a)
                 check(a not in runtime.running and b in runtime.running, 'Revocation affected sibling')
                 engine.enable(a)
